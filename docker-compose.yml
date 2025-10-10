@@ -1,10 +1,15 @@
+name: jenkins-docker-swarmified
+
 services:
   volume-init:
     image: alpine
     user: root
-    command: sh -c "rm -rf /var/shared-data/* || true"
+    container_name: volume-init
+    command: sh -c 'rm -rf /var/shared-data/* /auth/* /data/docker/registry/v2/repositories/* || true'
     volumes:
       - shared-data:/var/shared-data:volume-nocopy
+      - registry-password:/auth/registry.password
+      - registry-data:/data/
   jenkins-docker:
     image: docker:dind
     container_name: jenkins-docker
@@ -14,23 +19,26 @@ services:
     volumes:
       - jenkins-docker-certs:/certs/client
       - jenkins-data:/var/jenkins_home
+      - ./daemon.json:/etc/docker/daemon.json
     ports:
       - "2376:2376"
     networks:
       jenkins:
         aliases:
           - docker
+      deploy:
     command: --storage-driver overlay2
 
   my-jenkins:
     image: my-jenkins
     build:
       context: .
+      dockerfile: my-jenkins.Dockerfile
     container_name: my-jenkins
     restart: no
     command: sh -c "cp -f /var/.ssh/id_ed25519.pub /var/shared-data/ && touch /tmp/keyisset && exec /usr/local/bin/jenkins.sh"
     healthcheck:
-        test: ["CMD-SHELL", "test -f /tmp/keyisset -a -f /var/shared-data/id_ed25519.pub"]
+        test: ["CMD-SHELL", "test -f /tmp/keyisset -a -s /var/shared-data/id_ed25519.pub"]
         interval: 3s
         timeout: 3s
         retries: 10   
@@ -43,44 +51,119 @@ services:
       - shared-data:/var/shared-data:volume-nocopy
       - jenkins-data:/var/jenkins_home
       - jenkins-docker-certs:/certs/client:ro
+      - registry-data:/var/jenkins_home/registry-data/
+      - ./daemon.json:/etc/docker/daemon.json
     ports:
       - "8080:8080"
       - "50000:50000"
     networks:
       - jenkins
+      - deploy
     depends_on:
             volume-init:
                 condition: service_completed_successfully
-    
-  deploy-server:
-    image: deploy-server
+  node0:
+    image: node0
     build:
       context: .
-      dockerfile: deploy-server.Dockerfile
-    container_name: deploy-server
-    command: sh -c "cat /var/shared-data/id_ed25519.pub > /root/.ssh/authorized_keys && service ssh restart && sleep infinity"
-    environment:
-      - DOCKER_HOST=tcp://docker:2376
-      - DOCKER_CERT_PATH=/certs/client
-      - DOCKER_TLS_VERIFY=1
+      dockerfile: node0.Dockerfile
+    container_name: node0
+    privileged: true
+    entrypoint: node0-entrypoint.sh
+    ports:
+      - "8000:8000"
+    networks:
+        deploy:
+          ipv4_address: 10.1.0.10
     volumes:
       - shared-data:/var/shared-data:volume-nocopy
-      - jenkins-docker-certs:/certs/client:ro
-    networks:
-      - jenkins
+      - node0-data:/var/lib/docker
+      - node0-ssh-config:/etc/ssh/
+      - registry-data:/registry-data/
+      - ./daemon.json:/etc/docker/daemon.json
     depends_on:
-            my-jenkins:
-                condition: service_healthy
-                restart: true
-            volume-init:
+          my-jenkins:
+              condition: service_healthy
+              restart: true
+          volume-init:
+              condition: service_completed_successfully
+          registry:
+              condition: service_started
+  node1:
+    image: docker:dind
+    container_name: node1
+    privileged: true
+    networks:
+        deploy:
+          ipv4_address: 10.1.0.11
+    volumes:
+      - node1-data:/var/lib/docker
+      - ./daemon.json:/etc/docker/daemon.json
+    depends_on:
+        - node0
+        - registry
+  node2:
+    image: docker:dind
+    container_name: node2
+    privileged: true
+    networks:
+        deploy:
+          ipv4_address: 10.1.0.12
+    volumes:
+      - node2-data:/var/lib/docker
+      - ./daemon.json:/etc/docker/daemon.json
+    depends_on:
+        - node0
+        - registry
+  httpd:
+    image: httpd:latest
+    container_name: httpd
+    entrypoint: ""
+    command: sh -c 'htpasswd -Bbn ${REG_USER} ${REG_PASS} > /auth/registry.password'
+    volumes:
+      - registry-password:/auth/
+    restart: "no"
+    depends_on:
+      volume-init:
                 condition: service_completed_successfully
+  registry:
+    image: registry:latest
+    container_name: registry
+    environment:
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: Registry Realm
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/registry.password
+      REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY: /data
+      REGISTRY_STORAGE_DELETE_ENABLED: true
+    volumes:
+      - registry-password:/auth/
+      - registry-data:/data
+    networks:
+        deploy:
+          ipv4_address: 10.1.0.100
+    depends_on:
+          httpd:
+            condition: service_completed_successfully
+            restart: true
 
 networks:
   jenkins:
     driver: bridge
+  deploy:
+    driver: bridge
+    ipam:
+     config:
+        - subnet: 10.1.0.0/16
+          gateway: 10.1.0.1
 
 volumes:
   jenkins-docker-certs:
   jenkins-data:
   deploy-server-docker-certs:
   shared-data:
+  node0-data:
+  node1-data:
+  node2-data:
+  node0-ssh-config:
+  registry-data:
+  registry-password:
